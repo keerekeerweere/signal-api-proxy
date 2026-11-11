@@ -12,23 +12,42 @@ Auth: X-API-Key header, compared against config. Source IPs restricted to the
 configured networks. Method forwarding is impossible: this proxy only ever
 calls signal-cli's 'send' and 'version' RPCs and builds the payload itself.
 """
+import hashlib
+import hmac
 import http.server
 import ipaddress
 import json
 import os
 import re
 import sys
+import tempfile
+import threading
+import time
+import urllib.parse
 import urllib.request
 import base64
 
 CONFIG_PATH = os.environ.get("SIGNAL_PROXY_CONFIG",
                              os.path.expanduser("~/.config/signal-api-proxy/config.json"))
-DAEMON = "http://127.0.0.1:8080/api/v1/rpc"
+# Overridable so the proxy can run in a container next to a host-run signal-cli.
+DAEMON = os.environ.get("SIGNAL_PROXY_DAEMON") or "http://127.0.0.1:8080/api/v1/rpc"
 MAX_BODY = 20 * 1024 * 1024  # allows HA base64_attachments (JSON body, not multipart)
 MAX_MESSAGE = 6000
 MAX_ATT_BYTES = 10 * 1024 * 1024
 MAX_ATT_COUNT = 4
-SPOOL_DIR = os.path.expanduser("~/.local/share/signal-api-proxy/spool")
+MAX_RECIPIENTS = 10  # numbers + groups per request, after de-duplication
+SOCKET_TIMEOUT = 30
+# Loop guard defaults; override with "duplicate_limit" / "duplicate_window_seconds"
+# in config.json ("duplicate_limit": 0 disables it).
+DUPLICATE_LIMIT = 3
+DUPLICATE_WINDOW = 600  # seconds
+MAX_TRACKED_DIGESTS = 5000
+# signal-cli reads attachments by path, so this directory must exist at the SAME
+# path for the daemon (matters when the proxy runs in a container).
+SPOOL_DIR = (os.environ.get("SIGNAL_PROXY_SPOOL")
+             or os.path.expanduser("~/.local/share/signal-api-proxy/spool"))
+# Content types a browser can send cross-origin without a CORS preflight.
+BROWSER_FORM_TYPES = ("text/plain", "application/x-www-form-urlencoded", "multipart/form-data")
 # magic bytes -> extension; only these types accepted
 ATT_SIGNATURES = [
     (b"\xff\xd8\xff", "jpg"),
@@ -37,6 +56,7 @@ ATT_SIGNATURES = [
     (b"RIFF", "webp"),  # validated further below
     (b"\x1aE\xdf\xa3", "webm"),
 ]
+QUERY_RE = re.compile(r"\?[^\s\"']*")
 GROUP_RE = re.compile(r"^group:[A-Za-z0-9+/=]{20,120}$")
 
 
@@ -51,11 +71,50 @@ def att_kind(head: bytes) -> str | None:
     return None
 
 
-def spool_attachments(payload: dict) -> tuple[list, list]:
-    """Decode HA/bbernhard base64_attachments to spool files. Returns (paths, errors)."""
+def raw_attachments(payload: dict) -> list:
     raw = payload.get("base64_attachments") or payload.get("attachments") or []
     if isinstance(raw, str):
         raw = [raw]
+    return raw if isinstance(raw, list) else []
+
+
+def content_digest(targets: list, message: str, attachments: list) -> bytes:
+    """Hash of who + what, so an identical send can be recognised again."""
+    h = hashlib.sha256()
+    for part in [*sorted(targets), "", message, "", *(str(a) for a in attachments)]:
+        b = part.encode("utf-8", "surrogatepass")
+        h.update(len(b).to_bytes(8, "big"))  # length-prefixed: no ambiguity between parts
+        h.update(b)
+    return h.digest()
+
+
+_recent_lock = threading.Lock()
+_recent: dict = {}  # digest -> timestamps of recent identical attempts
+
+
+def is_repeat_flood(digest: bytes, limit: int, window: float) -> bool:
+    """True when `limit` identical requests were already let through in the last
+    `window` seconds. Only accepted requests are recorded, so at most `limit`
+    identical sends pass per rolling window, however hard a caller loops."""
+    if limit <= 0:
+        return False
+    now = time.monotonic()
+    with _recent_lock:
+        for k in [k for k, v in _recent.items() if now - v[-1] > window]:
+            del _recent[k]
+        stamps = [t for t in _recent.get(digest, []) if now - t <= window]
+        if len(stamps) >= limit:
+            _recent[digest] = stamps
+            return True
+        if digest not in _recent and len(_recent) >= MAX_TRACKED_DIGESTS:
+            del _recent[next(iter(_recent))]  # oldest inserted
+        _recent[digest] = stamps + [now]
+        return False
+
+
+def spool_attachments(payload: dict) -> tuple[list, list]:
+    """Decode HA/bbernhard base64_attachments to spool files. Returns (paths, errors)."""
+    raw = raw_attachments(payload)
     errors, paths = [], []
     if not raw:
         return paths, errors
@@ -75,11 +134,15 @@ def spool_attachments(payload: dict) -> tuple[list, list]:
         if ext is None:
             errors.append("attachment %d: unsupported type (jpg/png/gif/webp/mp4/webm only)" % i)
             continue
-        path = os.path.join(SPOOL_DIR, "att-%d-%s.%s" % (os.getpid(), i, ext))
-        with open(path, "wb") as f:
-            f.write(data)
-        os.chmod(path, 0o600)
-        paths.append(path)
+        try:
+            # unique per request (threads share a pid); mkstemp creates the file 0600
+            fd, path = tempfile.mkstemp(prefix="att-", suffix="." + ext, dir=SPOOL_DIR)
+            paths.append(path)
+            with os.fdopen(fd, "wb") as f:
+                f.write(data)
+        except OSError as e:
+            sys.stderr.write("spool write failed: %r\n" % (e,))
+            errors.append("attachment %d: could not be stored" % i)
     if errors:
         for p in paths:
             try:
@@ -110,7 +173,7 @@ def rpc(method: str, params: dict) -> dict:
     req = urllib.request.Request(
         DAEMON,
         data=json.dumps({"jsonrpc": "2.0", "method": method, "params": params, "id": 1}).encode(),
-        headers={"Content-Type": "application/json", "Host": "127.0.0.1:8080"},
+        headers={"Content-Type": "application/json"},
     )
     with urllib.request.urlopen(req, timeout=30) as r:
         return json.loads(r.read().decode())
@@ -118,9 +181,13 @@ def rpc(method: str, params: dict) -> dict:
 
 class Handler(http.server.BaseHTTPRequestHandler):
     server_version = "SignalSendProxy/1"
+    timeout = SOCKET_TIMEOUT  # idle/slow clients cannot pin a thread forever
 
     def log_message(self, fmt, *args):  # compact, but keep source IP for audit
-        sys.stderr.write("%s [%s] %s\n" % (self.log_date_time_string(), self.client_address[0], fmt % args))
+        # Keys are header-only, but a client may still put one in the URL by
+        # mistake — never log query strings.
+        line = QUERY_RE.sub("?<redacted>", fmt % args)
+        sys.stderr.write("%s [%s] %s\n" % (self.log_date_time_string(), self.client_address[0], line))
 
     def _deny(self, code: int, why: str) -> None:
         self._json(code, {"ok": False, "error": why})
@@ -136,7 +203,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def _peer_in_allowed_networks(self, cfg: dict) -> bool:
         peer = self.client_address[0]
         nets = [ipaddress.ip_network(n) for n in cfg.get("allowed_networks", [])]
-        return (not nets) or any(ipaddress.ip_address(peer) in n for n in nets)
+        # fail closed: an empty/missing allowed_networks admits nobody
+        return any(ipaddress.ip_address(peer) in n for n in nets)
 
     def _authorized(self, cfg: dict, allow_lan_open: bool = False) -> bool:
         if not self._peer_in_allowed_networks(cfg):
@@ -146,12 +214,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
         expected = cfg.get("api_key", "")
         if not expected:
             return False
+        # Header only: a key in the URL would end up in logs, history and proxies.
         supplied = self.headers.get("X-API-Key", "")
         if not supplied:
-            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-            supplied = (qs.get("api_key") or qs.get("auth_key") or [""])[0]
-        import hmac
-        return hmac.compare_digest(supplied, expected)
+            return False
+        try:
+            return hmac.compare_digest(supplied, expected)
+        except TypeError:  # non-ASCII header value or non-string config key
+            return False
 
     def _route_path(self) -> str:
         # self.path is 'path?query'; do NOT urlparse() it: a leading '//' would be
@@ -211,7 +281,26 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self._deny(404, "not found")
 
+    def _from_browser(self) -> bool:
+        # CSRF guard for the keyless LAN mode: a web page open in a LAN browser
+        # could otherwise POST here cross-origin. Browsers always attach Origin
+        # to such POSTs; API clients (HA, curl) do not.
+        ctype = self.headers.get("Content-Type", "").split(";")[0].strip().lower()
+        return self.headers.get("Origin") is not None or ctype in BROWSER_FORM_TYPES
+
+    def _repeat_blocked(self, cfg: dict, targets: list, message: str, attachments: list) -> bool:
+        limit = int(cfg.get("duplicate_limit", DUPLICATE_LIMIT))
+        window = float(cfg.get("duplicate_window_seconds", DUPLICATE_WINDOW))
+        if not is_repeat_flood(content_digest(targets, message, attachments), limit, window):
+            return False
+        sys.stderr.write("blocked repeat: already %d identical sends within %ds\n" % (limit, window))
+        self._deny(429, "identical message already sent %d times in the last %ds" % (limit, window))
+        return True
+
     def do_POST(self):
+        if self._from_browser():
+            self._deny(403, "browser-originated requests are not accepted")
+            return
         path = self._route_path()
         if path == "/send":
             self._handle_v1_send()
@@ -226,10 +315,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             if length <= 0 or length > MAX_BODY:
                 self._deny(400, "bad content length")
                 return None
-            return json.loads(self.rfile.read(length).decode("utf-8"))
+            payload = json.loads(self.rfile.read(length).decode("utf-8"))
         except Exception:
             self._deny(400, "invalid JSON body")
             return None
+        if not isinstance(payload, dict):
+            self._deny(400, "JSON body must be an object")
+            return None
+        return payload
 
     def _handle_v2_send(self):
         cfg = load_config()
@@ -255,6 +348,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             numbers = [numbers]
         if isinstance(groups, str):
             groups = [groups]
+        if not isinstance(numbers, list) or not isinstance(groups, list):
+            self._deny(400, "recipients and groups must be lists")
+            return
+        # de-duplicate and cap: one request must not fan out into a flood
+        numbers = list(dict.fromkeys(str(n).strip() for n in numbers))
+        groups = list(dict.fromkeys(str(g).strip() for g in groups))
+        if len(numbers) + len(groups) > MAX_RECIPIENTS:
+            self._deny(400, "too many recipients (max %d)" % MAX_RECIPIENTS)
+            return
+        targets = numbers + ["group:" + g for g in groups]
+        if targets and self._repeat_blocked(cfg, targets, message, raw_attachments(payload)):
+            return
         att_paths, att_errors = spool_attachments(payload)
         if att_errors:
             sys.stderr.write("v2/send rejected attachments: %s\n" % "; ".join(att_errors))
@@ -326,6 +431,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         message = str(payload.get("message", ""))
         if not message or len(message) > MAX_MESSAGE:
             self._deny(400, "message must be 1-%d chars" % MAX_MESSAGE)
+            return
+        if self._repeat_blocked(cfg, [to], message, []):
             return
         params = {}
         if to.startswith("group:"):

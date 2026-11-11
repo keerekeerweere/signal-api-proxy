@@ -19,7 +19,7 @@ Runtime data (not in repo): attachment spool + the live config.
 
 ## What it exposes
 
-- `POST /send` `{"to":"+E164"|"group:<id>","message":"..."}` — always requires `X-API-Key` (or `?api_key=`)
+- `POST /send` `{"to":"+E164"|"group:<id>","message":"..."}` — always requires the `X-API-Key` header (keys in the URL are not accepted)
 - `GET /health` — requires key
 - bbernhard-compatible surface for HA native platform (keyless **only** when
   `v2send_lan_unauthenticated: true`, then gated by `allowed_networks`):
@@ -35,11 +35,18 @@ body itself and only ever calls `send`/`version`.
 
 ## Enforcement layers
 
-1. Source IP must match `allowed_networks` (CIDRs)
+1. Source IP must match `allowed_networks` (CIDRs); an empty list admits nobody
 2. API key constant-time compare (except the gated v2 endpoints above)
 3. Recipient + group allowlists — plus-less numbers accepted only when
    `+`-prefixed form is explicitly allowlisted (no country-code guessing)
-4. Body/attachment size and type limits
+4. Body/attachment size and type limits; max 10 de-duplicated recipients per request
+5. POSTs carrying an `Origin` header or a browser form content type are refused
+   (blocks web pages in a LAN browser from using the keyless endpoints)
+6. Loop guard: the same recipients + message + attachments go out at most
+   `duplicate_limit` (3) times per rolling `duplicate_window_seconds` (600 =
+   10 minutes); further identical requests get HTTP 429. `"duplicate_limit": 0`
+   disables it. Both are read from `config.json` on every request,
+   so changes apply without a restart. Counters are in memory (reset on restart).
 
 ## HA client facts (pinned pysignalclirestapi)
 
@@ -53,6 +60,29 @@ body itself and only ever calls `send`/`version`.
 signal-cli must be the **Java build** (this host: `~/.local/share/signal-cli-java`,
 JDK 25 at `~/.local/share/jdk/`). The GraalVM native build cannot process
 attachments (`Can't load library: awt`).
+
+## Docker (optional, proxy only)
+
+The image contains **only the proxy**. signal-cli stays on the host, registered
+and run exactly as before — nothing about its setup changes.
+
+```
+mkdir -p ~/.config/signal-api-proxy ~/.local/share/signal-api-proxy/spool
+cp config.json.example ~/.config/signal-api-proxy/config.json   # edit, chmod 600
+cp compose.example.yaml compose.yaml
+docker compose up -d --build
+```
+
+- `network_mode: host`: the proxy reaches the daemon on the host's loopback and
+  sees real client IPs for `allowed_networks`. On a bridge network the daemon
+  would have to listen beyond loopback, and client IPs can be masked.
+- The spool is mounted at the **same path** inside and outside the container,
+  because signal-cli reads attachments by the path the proxy gives it.
+- `PUID`/`PGID` (default 1000) must match the user running signal-cli.
+- Use either the systemd unit or the container, not both (same port).
+
+Environment overrides: `SIGNAL_PROXY_CONFIG`, `SIGNAL_PROXY_SPOOL`,
+`SIGNAL_PROXY_DAEMON` (default `http://127.0.0.1:8080/api/v1/rpc`).
 
 ## Operations
 

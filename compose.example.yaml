@@ -1,0 +1,43 @@
+# Example: run the proxy in a container in front of a signal-cli daemon that
+# runs on the HOST (127.0.0.1:8080). signal-cli itself is not containerised.
+#
+#   mkdir -p ~/.config/signal-api-proxy ~/.local/share/signal-api-proxy/spool
+#   cp config.json.example ~/.config/signal-api-proxy/config.json   # edit, chmod 600
+#   cp compose.example.yaml compose.yaml
+#   docker compose up -d --build
+#
+# Create both directories BEFORE the first start; otherwise Docker creates them
+# as root and the proxy cannot write the spool.
+services:
+  signal-api-proxy:
+    build: .
+    image: signal-api-proxy:local
+    restart: unless-stopped
+
+    # Host networking on purpose:
+    #  - the proxy reaches signal-cli on the host's 127.0.0.1:8080, so the
+    #    daemon never has to listen on anything but loopback;
+    #  - the proxy sees real client IPs, which `allowed_networks` depends on.
+    # The listen address/port come from "bind"/"port" in config.json.
+    network_mode: host
+
+    # Must be the uid:gid that runs signal-cli on the host: attachments are
+    # written 0600 and signal-cli reads them by path.
+    user: "${PUID:-1000}:${PGID:-1000}"
+
+    environment:
+      # Same path inside and outside the container (see the spool volume).
+      SIGNAL_PROXY_SPOOL: ${HOME}/.local/share/signal-api-proxy/spool
+
+    volumes:
+      # Directory mount (not the file) so config edits are picked up live.
+      - ${HOME}/.config/signal-api-proxy:/config:ro
+      # Identical host and container path: the proxy hands these paths to signal-cli.
+      - ${HOME}/.local/share/signal-api-proxy/spool:${HOME}/.local/share/signal-api-proxy/spool
+
+    read_only: true
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m

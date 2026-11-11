@@ -10,5 +10,7 @@
   ],
   "allowed_groups": [],
   "local_account": "+32XXXXXXXXXX",
-  "v2send_lan_unauthenticated": true
+  "v2send_lan_unauthenticated": true,
+  "duplicate_limit": 3,
+  "duplicate_window_seconds": 600
 }
