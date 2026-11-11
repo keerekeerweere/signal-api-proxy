@@ -26,6 +26,8 @@ import time
 import urllib.parse
 import urllib.request
 import base64
+import time
+import threading
 
 CONFIG_PATH = os.environ.get("SIGNAL_PROXY_CONFIG",
                              os.path.expanduser("~/.config/signal-api-proxy/config.json"))
@@ -151,6 +153,35 @@ def spool_attachments(payload: dict) -> tuple[list, list]:
                 pass
         return [], errors
     return paths, errors
+
+
+DUP_LOCK = threading.Lock()
+_dup_state: dict = {}
+
+
+def duplicate_hit(dest_key: str, message: str, cfg: dict) -> bool:
+    """True when this identical message -> dest was already attempted
+    duplicate_limit times within duplicate_window_seconds. Attachments are
+    deliberately NOT part of the fingerprint: repeated doorbell snapshots
+    share one caption and that is exactly the spam to suppress. Attempts
+    count whether or not the daemon send ultimately succeeded."""
+    limit = int(cfg.get("duplicate_limit", 0) or 0)
+    if limit <= 0:
+        return False
+    window = int(cfg.get("duplicate_window_seconds", 600) or 600)
+    now = time.time()
+    key = (dest_key, message)
+    with DUP_LOCK:
+        hits = [t for t in _dup_state.get(key, []) if now - t < window]
+        if len(hits) >= limit:
+            _dup_state[key] = hits
+            return True
+        hits.append(now)
+        _dup_state[key] = hits
+        if len(_dup_state) > 1000:  # housekeeping
+            for k in [k for k, v in _dup_state.items() if not any(now - t < window for t in v)]:
+                del _dup_state[k]
+    return False
 
 
 def canon_recipient(n: str, allow: list) -> str | None:
@@ -367,12 +398,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         timestamps = []
         errors = []
+        suppressed = 0
         try:
             for n in numbers:
                 n = str(n).strip()
                 canon = canon_recipient(n, cfg.get("allowed_recipients", []))
                 if canon is None:
                     errors.append("bad or non-allowlisted number: %r" % n[:30])
+                    continue
+                if duplicate_hit("n:" + canon, message, cfg):
+                    suppressed += 1
+                    sys.stderr.write("v2/send duplicate suppressed: dest=%s (limit %s in %ss)\n" % (
+                        canon, cfg.get("duplicate_limit"), cfg.get("duplicate_window_seconds")))
                     continue
                 params = {"recipient": [canon], "message": message}
                 if att_paths:
@@ -389,6 +426,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 g = str(g).strip()
                 if not GROUP_RE.match("group:" + g) or g not in cfg.get("allowed_groups", []):
                     errors.append("group not allowlisted")
+                    continue
+                if duplicate_hit("g:" + g, message, cfg):
+                    suppressed += 1
+                    sys.stderr.write("v2/send duplicate suppressed: dest=group (limit %s in %ss)\n" % (
+                        cfg.get("duplicate_limit"), cfg.get("duplicate_window_seconds")))
                     continue
                 params = {"groupId": g, "message": message}
                 if att_paths:
@@ -414,10 +456,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             sys.stderr.write("v2/send rejected: %s | recipients=%s groups=%s sender=%r\n" % (
                 "; ".join(errors), numbers[:3], groups[:3], payload.get("number")))
             self._json(400, {"error": "; ".join(errors)})
+        elif suppressed and not timestamps:
+            self._json(201, {"result": None, "suppressed": True})
         elif errors:
             self._json(207, {"result": timestamps[-1], "partial_errors": errors})
         else:
-            self._json(201, {"result": timestamps[0]})
+            body = {"result": timestamps[0]}
+            if suppressed:
+                body["suppressed"] = suppressed
+            self._json(201, body)
 
     def _handle_v1_send(self):
         cfg = load_config()
