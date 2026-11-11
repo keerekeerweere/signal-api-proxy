@@ -1,0 +1,12 @@
+[Unit]
+Description=Authenticated Signal send proxy for LAN clients (Home Assistant)
+After=signal-cli-daemon.service
+Wants=signal-cli-daemon.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/dbram/signal-api-proxy/server.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
